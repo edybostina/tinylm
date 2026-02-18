@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package tinylm;
+
+service InferenceService {
+  rpc GenerateStream(GenerateRequest) returns (stream GenerateResponse) {}
+}
+
+message GenerateRequest {
+  string prompt = 1; // input text
+  int32 max_tokens = 2;
+  float temperature = 3; // sampling temperature (0 = greedy, 1 = default)
+  int32 top_k = 4;       // top-k filtering (0 = disabled)
+  float top_p = 5;       // nucleus sampling (1.0 = disabled)
+}
+
+message GenerateResponse {
+  string text = 1; // decoded stuff
+  bool is_finished = 2; // true if eos hit
+}

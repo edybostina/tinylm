@@ -9,7 +9,7 @@ configure:
     cd {{BUILD_DIR}} && cmake -DCMAKE_PREFIX_PATH={{LIBTORCH_PATH}} ..
 
 build: configure
-    cd {{BUILD_DIR}} && cmake --build . --config Release
+    cd {{BUILD_DIR}} && cmake --build . --config Release --parallel
 
 clean:
     rm -rf {{BUILD_DIR}}

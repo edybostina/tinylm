@@ -1,69 +1,107 @@
 #include <iostream>
-#include <vector>
-#include <string>
 #include <memory>
 #include <thread>
 #include <chrono>
+#include <grpcpp/grpcpp.h>
 
-#include "model/tokenizer.h"
 #include "model/loader.h"
+#include "model/tokenizer.h"
 #include "model/kv_cache.h"
 #include "scheduler/scheduler.h"
+#include "server/coordinator.h"
+#include "server/service.h"
+#include "config.h"
+#include "logger.h"
 
-int main() {
+void RunEngineLoop(std::shared_ptr<Scheduler> scheduler, std::shared_ptr<Coordinator> coordinator,
+				   const Config &config) {
+	LOG_INFO("Engine") << "Background thread started.";
+
+	while (!coordinator->stop_requested) {
+		if (!scheduler->has_work()) {
+			auto req_opt = coordinator->request_queue.wait_and_pop();
+			if (!req_opt)
+				break;
+			auto &req = *req_opt;
+			LOG_INFO("Engine") << "Picked up request " << req.request_id;
+			int max_gen = req.max_tokens > 0 ? req.max_tokens : config.default_max_tokens;
+			float temp = req.temperature > 0.0f ? req.temperature : config.default_temperature;
+			int top_k = req.top_k > 0 ? req.top_k : config.default_top_k;
+			float top_p = req.top_p > 0.0f && req.top_p < 1.0f ? req.top_p : config.default_top_p;
+			scheduler->add_request(req.request_id, req.prompt, req.token_ids, max_gen, temp, top_k, top_p);
+		}
+
+		while (auto req_opt = coordinator->request_queue.try_pop()) {
+			auto &req = *req_opt;
+			LOG_INFO("Engine") << "Picked up request " << req.request_id;
+			int max_gen = req.max_tokens > 0 ? req.max_tokens : config.default_max_tokens;
+			float temp = req.temperature > 0.0f ? req.temperature : config.default_temperature;
+			int top_k = req.top_k > 0 ? req.top_k : config.default_top_k;
+			float top_p = req.top_p > 0.0f && req.top_p < 1.0f ? req.top_p : config.default_top_p;
+			scheduler->add_request(req.request_id, req.prompt, req.token_ids, max_gen, temp, top_k, top_p);
+		}
+
+		std::vector<StepResult> results = scheduler->step();
+
+		for (const auto &res : results) {
+			if (coordinator->is_cancelled(res.request_id))
+				continue;
+
+			auto client_queue = coordinator->get_queue(res.request_id);
+			if (client_queue) {
+				client_queue->push(res);
+			}
+		}
+	}
+
+	LOG_INFO("Engine") << "Shutdown.";
+}
+
+int main(int argc, char **argv) {
+	Config config = Config::parse_args(argc, argv);
 	try {
+		std::string server_address = config.server_address;
+
+		LOG_INFO("Main") << "--- Initializing tinylm ---";
+		LOG_INFO("Main") << "Model: " << config.model_path;
+		LOG_INFO("Main") << "Tokenizer: " << config.tokenizer_path;
 		torch::Device device(torch::kCPU);
 
-		Tokenizer tokenizer("sentencepiece_models/sentencepiece.bpe.model");
-		Loader loader("pytorch_weights/tiny.pt", device);
+		Tokenizer tokenizer(config.tokenizer_path);
+		Loader loader(config.model_path, device);
 
-		int block_size = 16;
-		auto kv_cache = std::make_unique<PagedKVCache>(100, 2, 64, block_size, device, torch::kFloat32);
+		LOG_INFO("Main") << "KV cache: " << config.kv_num_blocks << " blocks, " << config.kv_num_heads
+						 << " heads, head_dim=" << config.kv_head_dim << ", block_size=" << config.kv_block_size;
+		LOG_INFO("Main") << "Max batch size: " << config.max_batch_size;
 
-		Scheduler scheduler(std::move(kv_cache), loader, tokenizer, block_size);
+		auto kv_cache = std::make_unique<PagedKVCache>(config.kv_num_blocks, config.kv_num_heads, config.kv_head_dim,
+													   config.kv_block_size, device, torch::kFloat32);
 
-		std::vector<std::string> prompts = {"Hello, my name is tinylm and", "The capital of France is"};
+		auto scheduler = std::make_shared<Scheduler>(std::move(kv_cache), loader, tokenizer, config.kv_block_size,
+													 config.max_batch_size);
+		auto coordinator = std::make_shared<Coordinator>();
 
-		for (const auto& prompt : prompts) {
-			std::vector<int> tokens = tokenizer.encode(prompt, true);
-			uint64_t req_id = scheduler.add_request(prompt, tokens);
-			std::cout << "[Server] Added Request " << req_id << " (" << tokens.size() << " prompt tokens)\n";
-		}
+		std::thread engine_thread(RunEngineLoop, scheduler, coordinator, config);
 
-		int step_count = 0;
-		bool active = true;
+		InferenceServiceImpl service(coordinator, tokenizer);
 
-		while (active) {
-			std::vector<StepResult> results = scheduler.step();
+		grpc::ServerBuilder builder;
+		builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+		builder.RegisterService(&service);
 
-			if (results.empty()) {
-				active = false;
-				break;
-			}
+		std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
+		LOG_INFO("Main") << "Server listening on " << server_address;
 
-			for (const auto& res : results) {
-				std::string decoded_text = tokenizer.decode(res.new_token_id);
+		server->Wait();
 
-				std::cout << "[Req " << res.request_id << "] generated: '" << decoded_text
-						  << "' (ID: " << res.new_token_id << ")\n";
+		coordinator->stop_requested = true;
+		coordinator->request_queue.shutdown();
+		engine_thread.join();
+		LOG_INFO("Main") << "Engine thread joined. Exiting.";
 
-				if (res.is_finished) {
-					std::cout << "[Req " << res.request_id << "] --- FINISHED ---\n";
-				}
-			}
-
-			step_count++;
-
-			if (step_count >= 20) {
-				std::cout << "\n[Server] Reached 20 max steps for simulation. Stopping.\n";
-				break;
-			}
-
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-		}
-
-	} catch (const std::exception& e) {
-		std::cerr << "Fatal Error: " << e.what() << "\n";
+	} catch (const std::exception &e) {
+		LOG_ERROR("Main") << "Fatal error: " << e.what();
+		return 1;
 	}
 
 	return 0;
