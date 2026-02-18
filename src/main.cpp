@@ -6,7 +6,6 @@
 
 #include "model/loader.h"
 #include "model/tokenizer.h"
-#include "model/kv_cache.h"
 #include "scheduler/scheduler.h"
 #include "server/coordinator.h"
 #include "server/service.h"
@@ -63,22 +62,18 @@ int main(int argc, char **argv) {
 		std::string server_address = config.server_address;
 
 		LOG_INFO("Main") << "--- Initializing tinylm ---";
-		LOG_INFO("Main") << "Model: " << config.model_path;
+		LOG_INFO("Main") << "Prefill model: " << config.prefill_model_path;
+		LOG_INFO("Main") << "Decode model: " << config.decode_model_path;
 		LOG_INFO("Main") << "Tokenizer: " << config.tokenizer_path;
 		torch::Device device(torch::kCPU);
 
 		Tokenizer tokenizer(config.tokenizer_path);
-		Loader loader(config.model_path, device);
+		Loader prefill_loader(config.prefill_model_path, device);
+		Loader decode_loader(config.decode_model_path, device);
 
-		LOG_INFO("Main") << "KV cache: " << config.kv_num_blocks << " blocks, " << config.kv_num_heads
-						 << " heads, head_dim=" << config.kv_head_dim << ", block_size=" << config.kv_block_size;
 		LOG_INFO("Main") << "Max batch size: " << config.max_batch_size;
 
-		auto kv_cache = std::make_unique<PagedKVCache>(config.kv_num_blocks, config.kv_num_heads, config.kv_head_dim,
-													   config.kv_block_size, device, torch::kFloat32);
-
-		auto scheduler = std::make_shared<Scheduler>(std::move(kv_cache), loader, tokenizer, config.kv_block_size,
-													 config.max_batch_size);
+		auto scheduler = std::make_shared<Scheduler>(prefill_loader, decode_loader, tokenizer, config.max_batch_size);
 		auto coordinator = std::make_shared<Coordinator>();
 
 		std::thread engine_thread(RunEngineLoop, scheduler, coordinator, config);

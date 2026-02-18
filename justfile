@@ -17,7 +17,7 @@ clean:
 rebuild: clean build
 
 run: build
-    ./{{BUILD_DIR}}/sandbox
+    ./{{BUILD_DIR}}/tinylm
 
 debug-config:
     mkdir -p {{BUILD_DIR}}
@@ -29,4 +29,4 @@ debug: debug-config
 info:
     @echo "Build directory: {{BUILD_DIR}}"
     @echo "LibTorch path: {{LIBTORCH_PATH}}"
-    @echo "Binary output: {{BUILD_DIR}}/sandbox"
+    @echo "Binary output: {{BUILD_DIR}}/tinylm"

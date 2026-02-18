@@ -39,17 +39,18 @@ add_custom_command(
 file(GLOB_RECURSE SOURCES "src/*.cpp")
 file(GLOB_RECURSE HEADERS "src/*.h" "src/*.hpp")
 
-add_executable(sandbox ${SOURCES} ${HEADERS} ${PROTO_SRC} ${PROTO_HDR} ${GRPC_SRC} ${GRPC_HDR})
+list(FILTER SOURCES EXCLUDE REGEX "kv_cache\\.cpp$")
 
-target_include_directories(sandbox PRIVATE 
+add_executable(tinylm ${SOURCES} ${HEADERS} ${PROTO_SRC} ${PROTO_HDR} ${GRPC_SRC} ${GRPC_HDR})
+
+target_include_directories(tinylm PRIVATE 
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR}
     ${SENTENCEPIECE_INCLUDE_DIR}
 )
 
-message(STATUS "Forcing Link Order: Protobuf -> gRPC -> Torch -> SentencePiece")
 
-target_link_libraries(sandbox 
+target_link_libraries(tinylm 
     ${Protobuf_LIBRARIES}
 
     gRPC::grpc++
@@ -62,5 +63,5 @@ target_link_libraries(sandbox
 
 if (MSVC)
   file(GLOB TORCH_DLLS "${TORCH_INSTALL_PREFIX}/lib/*.dll")
-  add_custom_command(TARGET sandbox POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TORCH_DLLS} $<TARGET_FILE_DIR:sandbox>)
+  add_custom_command(TARGET tinylm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TORCH_DLLS} $<TARGET_FILE_DIR:tinylm>)
 endif (MSVC)

@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <torch/script.h>
 
 enum class SequenceState { WAITING, RUNNING, FINISHED };
 
@@ -14,9 +15,6 @@ class Sequence {
 	std::vector<int> token_ids_;
 	size_t prompt_length_;
 
-	std::vector<int64_t> block_table_;
-	int block_size_;
-
 	SequenceState state_;
 
 	int max_tokens_;
@@ -25,9 +23,13 @@ class Sequence {
 	int top_k_;
 	float top_p_;
 
+	torch::Tensor key_cache_;
+	torch::Tensor value_cache_;
+	bool is_prefilled_ = false;
+
    public:
-	Sequence(uint64_t request_id, const std::string &user_prompt, const std::vector<int> &prompt_tokens, int block_size,
-			 int max_tokens, float temperature = 1.0f, int top_k = 0, float top_p = 1.0f);
+	Sequence(uint64_t request_id, const std::string &user_prompt, const std::vector<int> &prompt_tokens, int max_tokens,
+			 float temperature = 1.0f, int top_k = 0, float top_p = 1.0f);
 
 	uint64_t get_id() const {
 		return request_id_;
@@ -68,16 +70,29 @@ class Sequence {
 		return token_ids_.size();
 	}
 
-	bool needs_new_block() const;
-	void add_block(int64_t physical_block_index);
-	void clear_blocks() {
-		block_table_.clear();
-	}
-	
 	void reset_to_prompt() {
 		token_ids_.resize(prompt_length_);
+		key_cache_.reset();
+		value_cache_.reset();
+		is_prefilled_ = false;
 	}
-	const std::vector<int64_t> &get_block_table() const {
-		return block_table_;
+
+	// KV cache accessors
+	bool is_prefilled() const {
+		return is_prefilled_;
+	}
+	void set_prefilled(bool v) {
+		is_prefilled_ = v;
+	}
+
+	const torch::Tensor &get_key_cache() const {
+		return key_cache_;
+	}
+	const torch::Tensor &get_value_cache() const {
+		return value_cache_;
+	}
+	void set_kv_cache(torch::Tensor keys, torch::Tensor values) {
+		key_cache_ = std::move(keys);
+		value_cache_ = std::move(values);
 	}
 };

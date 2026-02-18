@@ -7,7 +7,6 @@
 #include <string>
 
 #include "../model/loader.h"
-#include "../model/kv_cache.h"
 #include "../model/tokenizer.h"
 #include "sequence.h"
 
@@ -19,23 +18,20 @@ struct StepResult {
 
 class Scheduler {
    private:
-	std::unique_ptr<PagedKVCache> kv_cache_;
-	Loader &model_loader_;
+	Loader &prefill_loader_;
+	Loader &decode_loader_;
 	Tokenizer &tokenizer_;
 
 	std::deque<Sequence> waiting_sequences_;
 	std::vector<Sequence> running_sequences_;
 
-	int block_size_;
 	int max_batch_size_;
 
    public:
-	Scheduler(std::unique_ptr<PagedKVCache> kv_cache, Loader &loader, Tokenizer &tokenizer, int block_size,
-			  int max_batch_size = 32)
-		: kv_cache_(std::move(kv_cache)),
-		  model_loader_(loader),
+	Scheduler(Loader &prefill_loader, Loader &decode_loader, Tokenizer &tokenizer, int max_batch_size = 32)
+		: prefill_loader_(prefill_loader),
+		  decode_loader_(decode_loader),
 		  tokenizer_(tokenizer),
-		  block_size_(block_size),
 		  max_batch_size_(max_batch_size) {}
 
 	void add_request(uint64_t request_id, const std::string &user_prompt, const std::vector<int> &token_ids,
