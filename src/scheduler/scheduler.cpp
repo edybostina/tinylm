@@ -20,15 +20,26 @@ static int sample_token(torch::Tensor logits, float temperature, int top_k, floa
 	if (top_p < 1.0f) {
 		torch::Tensor sorted_logits, sorted_indices;
 		std::tie(sorted_logits, sorted_indices) = torch::sort(logits, /*dim=*/0, /*descending=*/true);
-		torch::Tensor cumulative_probs = torch::cumsum(torch::softmax(sorted_logits, 0), 0);
-		torch::Tensor remove_mask = cumulative_probs - torch::softmax(sorted_logits, 0) > top_p;
+
+		torch::Tensor probs = torch::softmax(sorted_logits, 0);
+		torch::Tensor cumulative_probs = torch::cumsum(probs, 0);
+
+		torch::Tensor remove_mask = cumulative_probs - probs > top_p;
+
 		sorted_logits.masked_fill_(remove_mask, -std::numeric_limits<float>::infinity());
+
 		torch::Tensor original_order_logits = torch::zeros_like(logits);
 		original_order_logits.scatter_(0, sorted_indices, sorted_logits);
 		logits = original_order_logits;
 	}
 
 	torch::Tensor probs = torch::softmax(logits, 0);
+
+	if (probs.isnan().any().item<bool>()) {
+		LOG_WARN("Scheduler") << "NaN detected in probabilities, falling back to argmax";
+		return torch::argmax(logits, -1).item<int>();
+	}
+
 	return torch::multinomial(probs, 1).item<int>();
 }
 
@@ -51,8 +62,7 @@ std::vector<StepResult> Scheduler::step() {
 		if (kv_cache_->available_blocks() < blocks_to_allocate) {
 			if (!running_sequences_.empty()) {
 				Sequence &victim = running_sequences_.back();
-				LOG_WARN("Scheduler") << "OOM: preempting sequence " << victim.get_id() << " to free "
-									  << victim.get_block_table().size() << " blocks";
+				LOG_WARN("Scheduler") << "OOM: preempting sequence " << victim.get_id();
 				kv_cache_->free_blocks(victim.get_block_table());
 				victim.clear_blocks();
 				victim.reset_to_prompt();
@@ -79,14 +89,11 @@ std::vector<StepResult> Scheduler::step() {
 	std::vector<int64_t> forward_pass_tokens;
 	std::vector<int> tokens_per_sequence;
 	std::vector<int64_t> position_ids_vec;
-	std::vector<int64_t> block_tables_vec;
 	std::vector<int> slots_vec;
 
 	int max_blocks_per_seq = 0;
-	if (!running_sequences_.empty()) {
-		for (const auto &seq : running_sequences_) {
-			max_blocks_per_seq = std::max(max_blocks_per_seq, (int)seq.get_block_table().size());
-		}
+	for (const auto &seq : running_sequences_) {
+		max_blocks_per_seq = std::max(max_blocks_per_seq, (int)seq.get_block_table().size());
 	}
 
 	int batch_size = running_sequences_.size();
@@ -120,60 +127,81 @@ std::vector<StepResult> Scheduler::step() {
 		seq_idx++;
 	}
 
+	auto options = torch::TensorOptions().dtype(torch::kInt64).device(model_loader_.get_device());
 	torch::Tensor input_tensor =
-		torch::from_blob(forward_pass_tokens.data(), {1, static_cast<long long>(forward_pass_tokens.size())},
-						 torch::TensorOptions().dtype(torch::kInt64))
-			.to(model_loader_.get_device())
-			.clone();
-
+		torch::from_blob(forward_pass_tokens.data(), {1, (long long)forward_pass_tokens.size()}, options).clone();
 	torch::Tensor position_ids =
-		torch::from_blob(position_ids_vec.data(), {1, static_cast<long long>(position_ids_vec.size())},
-						 torch::TensorOptions().dtype(torch::kInt64))
-			.to(model_loader_.get_device())
-			.clone();
-
+		torch::from_blob(position_ids_vec.data(), {1, (long long)position_ids_vec.size()}, options).clone();
+	torch::Tensor slots_tensor = torch::from_blob(slots_vec.data(), {(long long)slots_vec.size()}, options).clone();
 	block_tables_tensor = block_tables_tensor.to(model_loader_.get_device());
 
-	torch::Tensor slots_tensor = torch::from_blob(slots_vec.data(), {static_cast<long long>(slots_vec.size())},
-												  torch::TensorOptions().dtype(torch::kInt64))
-									 .to(model_loader_.get_device())
-									 .clone();
-
 	torch::Tensor logits;
+	bool using_fallback = false;
+
 	try {
 		std::vector<torch::IValue> inputs = {
 			input_tensor,		 position_ids, kv_cache_->get_key_cache(), kv_cache_->get_value_cache(),
 			block_tables_tensor, slots_tensor};
 		logits = model_loader_.forward(inputs).toTensor();
 	} catch (const c10::Error &e) {
-		LOG_WARN("Scheduler") << "PagedAttention forward failed (" << e.msg() << "), falling back to naive forward.";
-		std::vector<torch::IValue> inputs = {input_tensor};
-		logits = model_loader_.forward(inputs).toTensor();
+		static bool warned = false;
+		if (!warned) {
+			LOG_WARN("Scheduler") << "Switching to Fallback. Reason: " << e.msg();
+			warned = true;
+		}
+
+		std::vector<torch::Tensor> seq_logits_list;
+		using_fallback = true;
+
+		int vocab_size = tokenizer_.get_vocab_size();
+
+		for (const Sequence &seq : running_sequences_) {
+			const auto &src_tokens = seq.get_token_ids();
+
+			std::vector<int64_t> full_tokens(src_tokens.begin(), src_tokens.end());
+
+			for (size_t i = 0; i < full_tokens.size(); ++i) {
+				if (full_tokens[i] >= vocab_size || full_tokens[i] < 0) {
+					LOG_ERROR("Scheduler") << "Found INVALID token ID " << full_tokens[i]
+										   << " (Vocab size: " << vocab_size << "). Replacing with 0.";
+					full_tokens[i] = 0;
+				}
+			}
+
+			auto full_input = torch::from_blob(full_tokens.data(), {1, (long long)full_tokens.size()}, torch::kInt64)
+								  .to(model_loader_.get_device())
+								  .clone();
+
+			try {
+				auto output = model_loader_.forward({full_input}).toTensor();
+				seq_logits_list.push_back(output[0][-1]);
+			} catch (const std::exception &inner_e) {
+				LOG_ERROR("Scheduler") << "Fallback failed for seq " << seq.get_id() << ": " << inner_e.what();
+				seq_logits_list.push_back(torch::zeros({vocab_size}, options.dtype(torch::kFloat32)));
+			}
+		}
+		logits = torch::stack(seq_logits_list).unsqueeze(0);
 	}
 
 	int current_token_offset = 0;
 	int seq_index = 0;
 
 	for (Sequence &seq : running_sequences_) {
-		int num_tokens_for_this_seq = tokens_per_sequence[seq_index];
+		int num_tokens_for_this_seq = using_fallback ? 1 : tokens_per_sequence[seq_index];
 		int target_logit_index = current_token_offset + num_tokens_for_this_seq - 1;
 
 		torch::Tensor seq_logits = logits[0][target_logit_index];
-
 		int new_token_id = sample_token(seq_logits, seq.get_temperature(), seq.get_top_k(), seq.get_top_p());
 
 		bool is_finished = (new_token_id == tokenizer_.get_eos_id());
 		int tokens_generated = seq.get_token_ids().size() - seq.get_prompt_length();
-		if (tokens_generated >= seq.get_max_tokens()) {
+		if (tokens_generated >= seq.get_max_tokens())
 			is_finished = true;
-		}
 
 		if (seq.needs_new_block()) {
 			if (kv_cache_->available_blocks() > 0) {
 				seq.add_block(kv_cache_->allocate_block());
 			} else {
-				LOG_ERROR("Scheduler") << "OOM mid-generation for sequence " << seq.get_id()
-									   << ", terminating gracefully.";
 				seq.set_state(SequenceState::FINISHED);
 				kv_cache_->free_blocks(seq.get_block_table());
 				results.push_back({seq.get_id(), tokenizer_.get_eos_id(), true});
@@ -184,14 +212,11 @@ std::vector<StepResult> Scheduler::step() {
 		}
 
 		seq.append_token(new_token_id);
-
 		if (is_finished) {
 			seq.set_state(SequenceState::FINISHED);
 			kv_cache_->free_blocks(seq.get_block_table());
 		}
-
 		results.push_back({seq.get_id(), new_token_id, is_finished});
-
 		current_token_offset += num_tokens_for_this_seq;
 		seq_index++;
 	}
